@@ -161,6 +161,18 @@ def test_http_auth_and_import(tmp_path: Path):
         assert "new       triage-a-flaky-test v1" in out.stdout
         again = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         assert "unchanged triage-a-flaky-test v1" in again.stdout
+
+        from test_sessions import write_fixtures
+        claude_dir, codex_dir = write_fixtures(tmp_path)
+        cmd = [sys.executable, "-m", "llmrun_mcp", "publish-sessions", "--url", base + "/mcp", "--token", "secret-token",
+               "--claude-dir", str(claude_dir), "--codex-dir", str(codex_dir), "--state", str(tmp_path / "state.json")]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.count("published tr_") == 2, out.stdout
+        again = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        assert "no new sessions found" in again.stdout
+        traces = httpx.get(base + "/").json()["traces"]
+        assert traces == 2
     finally:
         proc.terminate()
         proc.wait(5)
