@@ -41,6 +41,19 @@ uv run llmrun-mcp import ~/.claude/skills ~/notes/workflows --tag legacy --dry-r
 LLMRUN_TOKEN=... uv run llmrun-mcp import ~/.claude/skills ~/notes/workflows --tag legacy
 ```
 
+## Publish your recent Claude Code and Codex sessions
+
+`publish-sessions` reads your local session logs (`~/.claude/projects/*/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`), turns the newest ones into traces, and uploads them. Each trace gets the first prompt as its goal, a summary (project, branch, tool counts, final reply), every tool call as a step, a trimmed transcript, and metadata (model, tokens, duration). The outcome is always `unknown`; rate it on the server.
+
+Before anything leaves your machine it is scrubbed: API keys (Anthropic, OpenAI, GitHub, AWS, Stripe, Slack, Google, Hugging Face, npm), private keys, JWTs, bearer tokens, `PASSWORD=`/`*_TOKEN=`-style assignments, passwords in URLs, your llmrun token, and email addresses are replaced with `[REDACTED]`, and your home directory becomes `~`. It is pattern-based, so look at a dry run first.
+
+```bash
+uv run llmrun-mcp publish-sessions --dry-run --out /tmp/llmrun-preview   # preview; read the JSON files
+LLMRUN_TOKEN=... uv run llmrun-mcp publish-sessions                      # publish the 5 newest
+```
+
+Options: `--limit N`, `--source claude|codex`, `--url` (or `$LLMRUN_URL`, default `https://mcp.llmrun.com/mcp`), `--min-steps` (default 1, skips sessions with no tool calls), `--keep-emails`. Uploaded session ids are remembered in `~/.config/llmrun/published-sessions.json`, so re-running publishes only new sessions; `--force` re-sends.
+
 ## Deploy to exe.dev
 
 One-time setup (from your laptop):
@@ -80,4 +93,4 @@ uv run llmrun-mcp serve --no-auth --db /tmp/llmrun.db     # http://localhost:800
 - Multiple users and per-user tokens (v1 is single-user, one shared token).
 - OAuth, which claude.ai custom connectors need. Claude Code works today with the header above.
 - A web page for browsing skills and traces.
-- A Claude Code hook that publishes a trace automatically at the end of every session.
+- A Claude Code hook that publishes a trace automatically at the end of every session (`publish-sessions` is the manual version).
