@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+from functools import lru_cache
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,6 +28,7 @@ CODEX_DIR = Path("~/.codex/sessions").expanduser()
 MAX_STEPS = 80
 MAX_TRANSCRIPT = 120_000
 MAX_TOOL_OUTPUT = 1_500
+MAX_PROMPTS = 40  # user prompts kept in metadata for search and clustering
 
 # ---------------------------------------------------------------- secrets
 
@@ -96,6 +99,7 @@ class Session:
     session_id: str
     cwd: str | None = None
     git_branch: str | None = None
+    repo: str | None = None
     model: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
@@ -134,6 +138,8 @@ class Session:
             "project": project,
             "cwd": self.cwd,
             "git_branch": self.git_branch,
+            "repo": normalize_repo(self.repo) or git_remote(self.cwd),
+            "prompts": [_clip(p, 500) for p in self.prompts[:MAX_PROMPTS]],
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "duration_min": _duration_min(self.started_at, self.ended_at),
@@ -171,6 +177,31 @@ def _duration_min(a: str | None, b: str | None) -> float | None:
         return round(d.total_seconds() / 60, 1)
     except Exception:  # noqa: BLE001
         return None
+
+
+def normalize_repo(url: str | None) -> str | None:
+    """git@github.com:me/x.git, https://user@github.com/me/x -> github.com/me/x"""
+    if not url:
+        return None
+    u = url.strip()
+    u = re.sub(r"^[a-z+]+://", "", u)
+    u = re.sub(r"^[^@/]+@", "", u)  # user@ / user:pass@
+    u = re.sub(r"^([^/:]+):(?!\d+/)", r"\1/", u)  # scp-style host:path
+    u = re.sub(r"^([^/:]+):\d+/", r"\1/", u)  # drop port
+    u = re.sub(r"(\.git)?/*$", "", u)
+    return u.lower() or None
+
+
+@lru_cache(maxsize=None)
+def git_remote(cwd: str | None) -> str | None:
+    """The origin remote of the repo at cwd, if that folder still exists locally."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    try:
+        out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return normalize_repo(out.stdout) if out.returncode == 0 else None
 
 
 def _jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -318,6 +349,7 @@ def parse_codex(path: Path) -> Session | None:
                 s.session_id = p.get("id") or s.session_id
                 s.cwd = p.get("cwd") or s.cwd
                 s.git_branch = (p.get("git") or {}).get("branch") or s.git_branch
+                s.repo = (p.get("git") or {}).get("repository_url") or s.repo
                 s.started_at = s.started_at or p.get("timestamp") or ts
                 continue
             if typ == "turn_context":
@@ -337,6 +369,7 @@ def parse_codex(path: Path) -> Session | None:
             if "instructions" in o and "id" in o and typ is None:
                 s.session_id = o.get("id") or s.session_id
                 s.git_branch = (o.get("git") or {}).get("branch") or s.git_branch
+                s.repo = (o.get("git") or {}).get("repository_url") or s.repo
                 s.started_at = s.started_at or o.get("timestamp")
                 continue
             if o.get("record_type"):

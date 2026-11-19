@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import db, skillmd
+from . import db, projects, skillmd
 
 INSTRUCTIONS = """\
 llmrun is a shared library of AI workflows that have actually worked.
@@ -36,11 +36,18 @@ description so another agent can tell when to use it.
 
 Use `comment` to leave specific, actionable review notes on a skill or trace:
 what was unclear, which step broke, what to change.
+
+The owner's past Claude Code and Codex sessions are imported as traces. Use
+`list_projects`, `get_project` and `search_sessions` to see what they have
+been working on, and `label_project` to record what they decide about each
+project (active / paused / stale / archived, a name, merges).
 """
 
 TraceOutcome = Literal["success", "partial", "failure", "unknown"]
 RatingOutcome = Literal["worked", "partial", "failed"]
 TargetType = Literal["skill", "trace"]
+ProjectStatus = Literal["active", "paused", "stale", "archived"]
+ProjectFilter = Literal["active", "paused", "stale", "archived", "unsorted", "all"]
 
 
 def create_server(db_path: str = ":memory:") -> MCPServer:
@@ -170,7 +177,7 @@ def create_server(db_path: str = ":memory:") -> MCPServer:
             model=model,
             metadata=metadata,
         )
-        return {"id": trace["id"], "skill_name": trace["skill_name"], "created_at": trace["created_at"]}
+        return {k: trace[k] for k in ("id", "skill_name", "created_at", "updated")}
 
     @mcp.tool()
     async def get_trace(trace_id: str) -> dict[str, Any]:
@@ -213,7 +220,82 @@ def create_server(db_path: str = ":memory:") -> MCPServer:
             db.add_rating, conn, target_type=target_type, target_id=target_id, outcome=outcome, note=note, author=author
         )
 
+    # ------------------------------------------------------------ projects
+
+    @mcp.tool()
+    async def list_projects(
+        status: ProjectFilter | None = None, since_days: int | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        """The owner's projects, found by grouping their imported sessions. Most recent first.
+
+        Sessions are grouped by git repo, else by folder; sessions started from
+        ~ or /tmp are clustered by topic (kind "topic"). Each project has
+        session counts, first/last seen, days_idle, top_terms, recent_goals,
+        `status` (the owner's decision, null if unsorted), `suggested_status`
+        (from recency) and `related` (similar projects, possible duplicates).
+
+        status: filter; default hides archived, "unsorted" shows undecided ones, "all" shows everything.
+        since_days: only projects touched in the last N days.
+        """
+        return guard(projects.list_projects, conn, status, since_days, limit)
+
+    @mcp.tool()
+    async def get_project(project: str, limit: int = 50) -> dict[str, Any]:
+        """One project in detail: its stats plus its sessions (date, branch, first prompt), newest first.
+
+        project: the key from list_projects, or a name / repo / folder name.
+        """
+        return guard(projects.get_project, conn, project, limit)
+
+    @mcp.tool()
+    async def search_sessions(
+        query: str, project: str | None = None, since_days: int | None = None, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Full-text search over the owner's sessions (prompts, summaries, transcripts).
+
+        Returns the best matches with a snippet and the project each belongs to.
+        Use it to answer "where did I work on X?" or to see what a topic cluster is about.
+        """
+        return guard(projects.search_sessions, conn, query, project, since_days, limit)
+
+    @mcp.tool()
+    async def label_project(
+        project: str,
+        status: ProjectStatus | None = None,
+        name: str | None = None,
+        note: str | None = None,
+        merge_into: str | None = None,
+    ) -> dict[str, Any]:
+        """Record the owner's decision about a project. Only pass the fields that change.
+
+        status: active (working on it now), paused (coming back to it), stale
+            (probably done or dropped), archived (hide it from list_projects).
+        name: a display name, e.g. "llmrun.com".
+        note: one or two lines on what it is or why it was archived.
+        merge_into: another project that is really the same thing (e.g. an old
+            folder or a topic cluster); its sessions move there for good.
+        Only call this after the owner agrees. Returns the updated project.
+        """
+        return guard(projects.label_project, conn, project, status, name, note, merge_into)
+
     # ------------------------------------------------------------ prompts
+
+    @mcp.prompt(name="organize_projects", description="Work out my active projects from my past sessions, together")
+    def organize_projects() -> str:
+        return (
+            "Help me sort out which projects I'm actually working on, using my imported Claude Code and Codex sessions.\n"
+            "1. Call list_projects(status=\"unsorted\"). Give me a short overview: how many projects, which look "
+            "active, which look stale, and any `related` pairs that might be the same project.\n"
+            "2. Go through them with me a few at a time, most recent first. For each, say in one line what it seems "
+            "to be (use top_terms and recent_goals; call get_project or search_sessions if unclear) and suggest a "
+            "status, a name, and merges. Ask me, then call label_project with what I decide. Don't label anything "
+            "I haven't agreed to; batch obvious ones (e.g. \"archive these 12 one-off sessions?\").\n"
+            "3. Topic clusters (kind \"topic\") are sessions started from my home folder: merge them into a real "
+            "project when they belong to one, otherwise treat them like any other project.\n"
+            "4. When everything is sorted, call list_projects(status=\"active\") and give me a final list I can "
+            "set up as Claude projects: for each, a name, one-line goal, the repo, and 3-5 lines of project "
+            "instructions drawn from how I actually work on it."
+        )
 
     @mcp.prompt(name="share_this_session", description="Publish what this session did as a trace, and a skill if it is reusable")
     def share_this_session() -> str:

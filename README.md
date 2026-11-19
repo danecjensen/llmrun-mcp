@@ -20,8 +20,12 @@ Hosted at `https://mcp.llmrun.com/mcp` (streamable HTTP, bearer token).
 | `get_trace(trace_id)` / `list_traces(skill_name, outcome, limit)` | Read traces, e.g. all failures of one skill. |
 | `comment(target_type, target_id, body)` | Review a skill or trace. |
 | `rate(target_type, target_id, outcome, note)` | worked / partial / failed. |
+| `list_projects(status, since_days, limit)` | Your projects, found by grouping imported sessions (see below). |
+| `get_project(project)` | One project's stats and sessions. |
+| `search_sessions(query, project, since_days, limit)` | Full-text search over imported sessions, with snippets. |
+| `label_project(project, status, name, note, merge_into)` | Record a decision: active / paused / stale / archived, a name, a merge. |
 
-Two prompts show up as slash commands in Claude Code: `share_this_session` (publish a trace, and a skill if it's reusable) and `find_workflow` (search before starting).
+Three prompts show up as slash commands in Claude Code: `share_this_session` (publish a trace, and a skill if it's reusable), `find_workflow` (search before starting) and `organize_projects` (see below).
 
 ## Use it from Claude Code
 
@@ -50,9 +54,16 @@ Before anything leaves your machine it is scrubbed: API keys (Anthropic, OpenAI,
 ```bash
 uv run llmrun-mcp publish-sessions --dry-run --out /tmp/llmrun-preview   # preview; read the JSON files
 LLMRUN_TOKEN=... uv run llmrun-mcp publish-sessions                      # publish the 5 newest
+LLMRUN_TOKEN=... uv run llmrun-mcp publish-sessions --all                # publish every session
 ```
 
-Options: `--limit N`, `--source claude|codex`, `--url` (or `$LLMRUN_URL`, default `https://mcp.llmrun.com/mcp`), `--min-steps` (default 1, skips sessions with no tool calls), `--keep-emails`. Uploaded session ids are remembered in `~/.config/llmrun/published-sessions.json`, so re-running publishes only new sessions; `--force` re-sends.
+Options: `--limit N`, `--source claude|codex`, `--url` (or `$LLMRUN_URL`, default `https://mcp.llmrun.com/mcp`), `--min-steps` (default 1, skips sessions with no tool calls), `--keep-emails`. Uploaded session ids are remembered in `~/.config/llmrun/published-sessions.json`, so re-running publishes only new sessions; `--force` re-sends them. A re-sent session updates its existing trace (matched on session id), so there are no duplicates.
+
+## Organize your projects
+
+Once your sessions are imported, the server can tell you what you've been working on. `list_projects` groups sessions by git repo (each session records its folder's `origin` remote, so checkouts and worktrees of one repo merge), else by folder. Sessions started from `~`, Desktop, Downloads or `/tmp` are clustered by topic instead, using TF-IDF over their prompts. Each project gets session counts, first and last seen, top terms, recent goals, a suggested status from recency (active under 3 weeks idle, paused under 3 months, else stale) and similar projects that may be duplicates.
+
+You decide the rest with `label_project`, and those decisions are kept on the server. In Claude Code, run the `organize_projects` prompt (`/mcp__llmrun__organize_projects`) and Claude walks you through them, then ends with a list of active projects ready to set up as Claude projects.
 
 ## Deploy to exe.dev
 
