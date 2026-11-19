@@ -35,13 +35,15 @@ def main(argv: list[str] | None = None) -> None:
 
     ps = sub.add_parser("publish-sessions", help="publish recent local Claude Code / Codex sessions as traces")
     ps.add_argument("--limit", type=int, default=5, help="how many sessions to publish (default 5, newest first)")
+    ps.add_argument("--all", action="store_true", help="publish every session, not just the newest --limit")
     ps.add_argument("--source", choices=["all", "claude", "codex"], default="all")
     ps.add_argument("--url", default=os.environ.get("LLMRUN_URL", "https://mcp.llmrun.com/mcp"))
     ps.add_argument("--token", default=os.environ.get("LLMRUN_TOKEN"))
     ps.add_argument("--dry-run", action="store_true", help="show what would be published, don't upload")
     ps.add_argument("--out", type=Path, help="also write each scrubbed trace as JSON here, to inspect before uploading")
     ps.add_argument("--min-steps", type=int, default=1, help="skip sessions with fewer tool calls (default 1)")
-    ps.add_argument("--force", action="store_true", help="re-publish sessions that were already uploaded")
+    ps.add_argument("--force", action="store_true",
+                    help="re-send sessions that were already uploaded (updates them in place, no duplicates)")
     ps.add_argument("--keep-emails", action="store_true", help="don't replace email addresses with [email]")
     ps.add_argument("--claude-dir", type=Path, default=Path("~/.claude/projects").expanduser())
     ps.add_argument("--codex-dir", type=Path, default=Path("~/.codex/sessions").expanduser())
@@ -85,6 +87,7 @@ def _mcp_client(url: str, token: str | None):
 
 async def _publish_sessions(args: argparse.Namespace) -> int:
     import json
+    from collections import Counter
 
     from . import sessions
 
@@ -100,7 +103,7 @@ async def _publish_sessions(args: argparse.Namespace) -> int:
     skip = set() if args.force else set(state.get(args.url, {}))
 
     found = sessions.recent_sessions(
-        args.limit, sources=args.source, skip_ids=skip, claude_dir=args.claude_dir,
+        10**9 if args.all else args.limit, sources=args.source, skip_ids=skip, claude_dir=args.claude_dir,
         codex_dir=args.codex_dir, min_steps=args.min_steps,
     )
     if not found:
@@ -112,7 +115,7 @@ async def _publish_sessions(args: argparse.Namespace) -> int:
 
     if args.out:
         args.out.mkdir(parents=True, exist_ok=True)
-    for s, t in traces:
+    for s, t in traces if len(traces) <= 20 or args.out else []:
         m = t["metadata"]
         print(f"{s.source:11} {m.get('started_at', '?')[:16]}  {m.get('project')}  "
               f"{m['user_prompts']} prompts, {m['tool_calls']} tool calls, transcript {len(t['transcript']):,} chars")
@@ -121,6 +124,9 @@ async def _publish_sessions(args: argparse.Namespace) -> int:
             f = args.out / f"{s.source}-{s.session_id}.json"
             f.write_text(json.dumps(t, indent=2, ensure_ascii=False))
             print(f"            wrote {f}")
+    if len(traces) > 20 and not args.out:
+        projects = Counter(t["metadata"].get("repo") or t["metadata"].get("project") for _, t in traces)
+        print(f"{len(traces)} sessions; top projects: " + ", ".join(f"{p} ({n})" for p, n in projects.most_common(15)))
     if args.dry_run:
         print(f"dry run: {len(traces)} trace(s) not uploaded")
         return 0
@@ -137,7 +143,11 @@ async def _publish_sessions(args: argparse.Namespace) -> int:
             out = res.structured_content or {}
             out = out.get("result", out)
             published[s.session_id] = out.get("id")
-            print(f"published {out.get('id')}  <- {s.source} {s.session_id}")
+            verb = "updated" if out.get("updated") else "published"
+            print(f"{verb} {out.get('id')}  <- {s.source} {s.session_id}")
+            if len(published) % 50 == 0:  # a long --all run can be interrupted and resumed
+                args.state.parent.mkdir(parents=True, exist_ok=True)
+                args.state.write_text(json.dumps(state, indent=2))
     args.state.parent.mkdir(parents=True, exist_ok=True)
     args.state.write_text(json.dumps(state, indent=2))
     print(f"done: {len(traces) - failures} published, {failures} failed")

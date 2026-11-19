@@ -55,6 +55,21 @@ CREATE TABLE IF NOT EXISTS traces (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS traces_skill ON traces(skill_name, created_at);
+CREATE INDEX IF NOT EXISTS traces_session ON traces(json_extract(metadata, '$.session_id'));
+
+CREATE VIRTUAL TABLE IF NOT EXISTS traces_fts USING fts5(
+    id UNINDEXED, goal, summary, prompts, transcript, tokenize = 'porter unicode61'
+);
+
+-- Decisions about projects found in session traces (see projects.py).
+CREATE TABLE IF NOT EXISTS project_labels (
+    key         TEXT PRIMARY KEY,
+    status      TEXT,
+    name        TEXT,
+    note        TEXT,
+    merge_into  TEXT,
+    updated_at  TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS comments (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,6 +123,14 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    n_traces = conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
+    if conn.execute("SELECT COUNT(*) FROM traces_fts").fetchone()[0] != n_traces:
+        # First start after upgrading, or the index drifted: rebuild it.
+        with conn:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM traces_fts")
+            for row in conn.execute("SELECT * FROM traces").fetchall():
+                _index_trace(conn, _trace_row(row))
     return conn
 
 
@@ -282,25 +305,77 @@ def add_trace(
         raise ValueError("goal and summary are required")
     if skill_name:
         skill_name = get_skill(conn, skill_name)["name"]
-    trace_id = "tr_" + uuid.uuid4().hex[:12]
-    conn.execute(
-        "INSERT INTO traces(id, skill_name, goal, summary, outcome, steps, transcript, agent, model, metadata, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            trace_id,
-            skill_name,
-            goal.strip(),
-            summary.strip(),
-            outcome,
-            json.dumps(steps or []),
-            transcript,
-            agent,
-            model,
-            json.dumps(metadata or {}),
-            now(),
-        ),
+    values = (
+        skill_name,
+        goal.strip(),
+        summary.strip(),
+        outcome,
+        json.dumps(steps or []),
+        transcript,
+        agent,
+        model,
+        json.dumps(metadata or {}),
     )
-    return get_trace(conn, trace_id)
+    session_id = (metadata or {}).get("session_id")
+    existing = None
+    if session_id:
+        # Re-publishing an imported session (it continued, or the importer
+        # improved) updates the same trace, keeping its comments and ratings.
+        existing = conn.execute(
+            "SELECT id, skill_name FROM traces WHERE json_extract(metadata, '$.session_id') = ?", (session_id,)
+        ).fetchone()
+    with conn:
+        conn.execute("BEGIN")
+        if existing:
+            trace_id = existing["id"]
+            conn.execute(
+                "UPDATE traces SET skill_name=COALESCE(?, skill_name), goal=?, summary=?, outcome=?, steps=?,"
+                " transcript=?, agent=?, model=?, metadata=? WHERE id=?",
+                (*values, trace_id),
+            )
+        else:
+            trace_id = "tr_" + uuid.uuid4().hex[:12]
+            conn.execute(
+                "INSERT INTO traces(skill_name, goal, summary, outcome, steps, transcript, agent, model, metadata,"
+                " created_at, id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*values, now(), trace_id),
+            )
+        trace = get_trace(conn, trace_id)
+        _index_trace(conn, trace)
+    return {**trace, "updated": existing is not None}
+
+
+def _index_trace(conn: sqlite3.Connection, t: dict[str, Any]) -> None:
+    prompts = t["metadata"].get("prompts") or []
+    conn.execute("DELETE FROM traces_fts WHERE id = ?", (t["id"],))
+    conn.execute(
+        "INSERT INTO traces_fts(id, goal, summary, prompts, transcript) VALUES (?, ?, ?, ?, ?)",
+        (t["id"], t["goal"], t["summary"], "\n".join(map(str, prompts)), t["transcript"] or ""),
+    )
+
+
+def search_traces(
+    conn: sqlite3.Connection, query: str, ids: set[str] | None = None, limit: int = 10
+) -> list[dict[str, Any]]:
+    """Full-text search over traces; best matches first, with a highlighted snippet."""
+    fts = _fts_query(query)
+    if not fts:
+        raise ValueError("query needs at least one word")
+    rows = conn.execute(
+        "SELECT t.id, t.goal, t.agent, t.created_at, t.metadata,"
+        " snippet(traces_fts, -1, '[', ']', ' … ', 24) AS snippet"
+        " FROM traces_fts f JOIN traces t ON t.id = f.id WHERE traces_fts MATCH ?"
+        " ORDER BY bm25(traces_fts, 0, 6.0, 2.0, 4.0, 1.0) LIMIT ?",
+        (fts, 2000 if ids is not None else max(1, min(limit, 100))),
+    ).fetchall()
+    out = []
+    for r in rows:
+        if ids is not None and r["id"] not in ids:
+            continue
+        out.append(dict(r))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _trace_row(row: sqlite3.Row) -> dict[str, Any]:
