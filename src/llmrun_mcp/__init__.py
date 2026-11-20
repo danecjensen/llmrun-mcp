@@ -3,6 +3,7 @@
   llmrun-mcp serve                  run the HTTP MCP server
   llmrun-mcp import PATH...         publish old workflows (SKILL.md / .md files) to a server
   llmrun-mcp publish-sessions       publish your recent Claude Code / Codex sessions as traces
+  llmrun-mcp seed-skills            find good public skills and preview (or load) them as seeds
   llmrun-mcp new-token              print a random token for LLMRUN_TOKEN
 """
 
@@ -50,6 +51,30 @@ def main(argv: list[str] | None = None) -> None:
     ps.add_argument("--state", type=Path, default=Path("~/.config/llmrun/published-sessions.json").expanduser(),
                     help="remembers which sessions were uploaded, so re-runs skip them")
 
+    sd = sub.add_parser("seed-skills", help="find good public agent skills; preview by default, --load to publish")
+    sd.add_argument("--source", action="append", default=[], metavar="OWNER/REPO[:SUBDIR]",
+                    help="skill source (repeatable; a local folder works too). Default: the built-in list")
+    sd.add_argument("--list-sources", action="store_true", help="print the built-in sources and exit")
+    sd.add_argument("--out", type=Path, default=Path("seed-preview"),
+                    help="where the preview goes (preview.md, preview.json, skills/*/SKILL.md)")
+    sd.add_argument("--load", action="store_true", help="actually load the accepted skills (default is a dry run)")
+    sd.add_argument("--db", help="with --load: write into this local SQLite file instead of a server")
+    sd.add_argument("--url", default=os.environ.get("LLMRUN_URL", "https://mcp.llmrun.com/mcp"))
+    sd.add_argument("--token", default=os.environ.get("LLMRUN_TOKEN"))
+    sd.add_argument("--allow-license", action="append", default=[], metavar="SPDX",
+                    help="also accept this license, e.g. CC-BY-SA-4.0 (repeatable)")
+    sd.add_argument("--max-age-days", type=int, default=365, help="skip sources with no commit in this many days (0 = off)")
+    sd.add_argument("--min-score", type=int, default=50, help="skip skills scoring below this (0-100, default 50)")
+    sd.add_argument("--allow-scripts", action="store_true",
+                    help="keep skills whose steps run bundled helper scripts (llmrun stores only the text)")
+    sd.add_argument("--self-contained-only", action="store_true",
+                    help="also skip skills that point to bundled reference docs")
+    sd.add_argument("--allow-risky", action="store_true", help="keep skills with risky instructions (they're flagged)")
+    sd.add_argument("--only", action="append", default=[], metavar="NAME", help="with --load: load only these skills")
+    sd.add_argument("--cache", type=Path, default=Path("~/.cache/llmrun/seed").expanduser(),
+                    help="where source repos are cloned")
+    sd.add_argument("--no-refresh", action="store_true", help="use cached clones as they are")
+
     sub.add_parser("new-token", help="print a random bearer token")
 
     args = p.parse_args(argv)
@@ -59,6 +84,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(asyncio.run(_import(args)))
     elif args.cmd == "publish-sessions":
         sys.exit(asyncio.run(_publish_sessions(args)))
+    elif args.cmd == "seed-skills":
+        sys.exit(asyncio.run(_seed_skills(args)))
     elif args.cmd == "new-token":
         print(secrets.token_urlsafe(32))
 
@@ -151,6 +178,72 @@ async def _publish_sessions(args: argparse.Namespace) -> int:
     args.state.parent.mkdir(parents=True, exist_ok=True)
     args.state.write_text(json.dumps(state, indent=2))
     print(f"done: {len(traces) - failures} published, {failures} failed")
+    return 1 if failures else 0
+
+
+async def _seed_skills(args: argparse.Namespace) -> int:
+    from . import seed, skillmd
+
+    if args.list_sources:
+        for s in seed.DEFAULT_SOURCES:
+            where = f"{s.repo}:{s.subdir}" if s.subdir else s.repo
+            print(f"{where:40} {s.note}")
+        return 0
+    if args.load and not args.db and not args.token:
+        print("LLMRUN_TOKEN is not set (or pass --token, or --db for a local file). "
+              "Leave out --load for a dry run.", file=sys.stderr)
+        return 2
+    try:
+        sources = [seed.parse_source(s) for s in args.source] or seed.DEFAULT_SOURCES
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    licenses = set(seed.DEFAULT_LICENSES) | set(args.allow_license)
+
+    cands, report = seed.run(
+        sources,
+        cache_dir=args.cache,
+        licenses=licenses,
+        max_age_days=args.max_age_days,
+        allow_risky=args.allow_risky,
+        self_contained_only=args.self_contained_only,
+        min_score=args.min_score,
+        allow_scripts=args.allow_scripts,
+        refresh=not args.no_refresh,
+    )
+    summary = seed.write_preview(args.out, cands, report)
+    n = summary["counts"]
+    print(f"found {n['found']} skills: {n['accepted']} pass, {n['rejected']} rejected. "
+          f"Preview: {args.out / 'preview.md'}")
+
+    accepted = sorted((c for c in cands if c.accepted), key=lambda c: (-c.score, c.name))
+    if args.only:
+        wanted = set(args.only)
+        accepted = [c for c in accepted if c.name in wanted]
+    if not args.load:
+        print("dry run: nothing loaded. Add --load (with LLMRUN_TOKEN or --db PATH) to load them.")
+        return 0
+
+    if args.db:
+        for name, res in seed.load_into_db(args.db, accepted):
+            print(f"{'new' if res['version'] == 1 and res['changed'] else 'updated' if res['changed'] else 'unchanged':9} {name} v{res['version']}")
+        print(f"done: {len(accepted)} skills into {args.db}")
+        return 0
+
+    failures = 0
+    async with _mcp_client(args.url, args.token) as client:
+        for c in accepted:
+            text = skillmd.render(seed.to_skill(c))
+            res = await client.call_tool("publish_skill_md", {"skill_md": text})
+            if res.is_error:
+                failures += 1
+                print(f"FAIL {c.name}: {res.content[0].text if res.content else res}", file=sys.stderr)
+                continue
+            out = res.structured_content or {}
+            out = out.get("result", out)
+            state = "new" if out.get("version") == 1 and out.get("changed") else ("updated" if out.get("changed") else "unchanged")
+            print(f"{state:9} {out.get('name')} v{out.get('version')}  <- {c.url}")
+    print(f"done: {len(accepted)} skills, {failures} failed")
     return 1 if failures else 0
 
 
