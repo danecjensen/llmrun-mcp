@@ -45,6 +45,26 @@ uv run llmrun-mcp import ~/.claude/skills ~/notes/workflows --tag legacy --dry-r
 LLMRUN_TOKEN=... uv run llmrun-mcp import ~/.claude/skills ~/notes/workflows --tag legacy
 ```
 
+## Seed it with public skills
+
+`seed-skills` pulls agent skills from well-maintained public libraries, keeps the good ones, and loads them as starting points. It clones each source (shallow, cached in `~/.cache/llmrun/seed`), reads every `SKILL.md`, and checks:
+
+- **License:** the nearest `LICENSE` file at or above the skill must be an open license (MIT, Apache-2.0, BSD, ISC, CC0, CC-BY-4.0, Unlicense). Add others with `--allow-license CC-BY-SA-4.0`.
+- **Maintenance:** the source has a commit in the last year (`--max-age-days`).
+- **Completeness:** a real description, instructions with headings or steps, not a template, not huge, and a quality score of 50+ (`--min-score`).
+- **Self-contained:** llmrun stores only the text, so skills whose steps run bundled helper scripts are skipped (`--allow-scripts` keeps them); ones that only point to reference docs are kept and tagged `needs-bundled-files`.
+- **Safety:** instructions that tell an agent to ignore its instructions, turn off permission prompts, run decoded base64 or wipe a home folder are rejected; installer one-liners piped into a shell are flagged for a look.
+
+Each skill keeps a footer with its source link (pinned to the commit), license and copyright line, plus tags `seed`, `src-<owner>-<repo>` and `license-<id>`. Re-running is safe: unchanged skills stay at the same version, and the first source in the list wins a name clash.
+
+```bash
+uv run llmrun-mcp seed-skills                                   # dry run: writes seed-preview/preview.md, preview.json, skills/*/SKILL.md
+uv run llmrun-mcp seed-skills --load --db /tmp/seed.db          # load into a local SQLite file to try it
+LLMRUN_TOKEN=... uv run llmrun-mcp seed-skills --load           # publish to mcp.llmrun.com
+```
+
+`--list-sources` shows the built-in list; `--source owner/repo[:subdir]` (repeatable, or a local folder) replaces it; `--only NAME` loads just the named skills.
+
 ## Publish your recent Claude Code and Codex sessions
 
 `publish-sessions` reads your local session logs (`~/.claude/projects/*/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`), turns the newest ones into traces, and uploads them. Each trace gets the first prompt as its goal, a summary (project, branch, tool counts, final reply), every tool call as a step, a trimmed transcript, and metadata (model, tokens, duration). The outcome is always `unknown`; rate it on the server.
